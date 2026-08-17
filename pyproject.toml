@@ -1,0 +1,8 @@
+[project]
+name = "telemetry-transport-lab"
+version = "0.1.0"
+description = "A learning lab for telemetry signals and communication transports."
+requires-python = ">=3.12"
+dependencies = [
+    "requests",
+]
