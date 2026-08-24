@@ -8,4 +8,8 @@ dependencies = [
     "websockets",
     "grpcio",
     "grpcio-tools",
+    "confluent-kafka",
 ]
+
+[tool.setuptools]
+packages = []
