@@ -1,0 +1,53 @@
+from confluent_kafka import Consumer
+
+
+config = {
+    "bootstrap.servers": "https://meowmetry-kafka.dev1.mnt.group",
+    "group.id": "telemetry-transport-lab",
+    "auto.offset.reset": "latest",
+
+}
+
+consumer = Consumer(config)
+
+consumer.subscribe(["signals"])
+
+
+while True:
+    message = consumer.poll(5.0)
+
+    if message is None:
+        print("No messages found")
+        continue
+
+    if message.error():
+        print(message.error())
+        continue
+
+    print(message.value())
+
+
+
+
+
+# from kafka import KafkaConsumer
+
+
+# consumer = KafkaConsumer(
+#     "signals",
+#     bootstrap_servers="https://meowmetry-kafka.dev1.mnt.group",
+#     group_id="telemetry-transport-lab",
+#     auto_offset_reset="latest",
+# )
+
+
+# while True:
+#     messages = consumer.poll(timeout_ms=5000)
+
+#     if not messages:
+#         print("No messages found in the last 5 seconds")
+#         continue
+
+#     for topic_partition, records in messages.items():
+#         for message in records:
+#             print(message.value)
