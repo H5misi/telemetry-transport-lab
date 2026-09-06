@@ -1,0 +1,237 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Kafka (KRaft mode, no ZooKeeper). Two client listeners, like Redpanda:
+  #   INTERNAL  kafka:9092                             -> containers on this network
+  #   EXTERNAL  meowmetry-kafka.dev1.mnt.group:29092   -> clients outside the network
+  #
+  # The EXTERNAL listener binds :9094 in the container and is published on host
+  # port 29092 (9092 is taken by Redpanda on this host). It advertises the public
+  # hostname so that a client bootstrapping from outside gets handed an address it
+  # can reach again (the advertised-listener dance). Reach it directly with a
+  # native Kafka client — no Caddy, since the broker protocol is raw TCP, not HTTP.
+  #   python kafka_consumer.py meowmetry-kafka.dev1.mnt.group:29092
+  # DNS for the hostname must resolve to this host, with TCP :29092 open.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.9.0
+    restart: unless-stopped
+    ports:
+      - "29092:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      # KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://meowmetry-kafka.dev1.mnt.group:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: [ "CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1" ]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+        # Web UI to eyeball topics/messages: http://localhost:8080
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    restart: unless-stopped
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: meowmetry
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      default:
+      caddy-ingress:
+    labels:
+      caddy: meowmetry-kafkaui.dev1.mnt.group
+      caddy.0_reverse_proxy: "{{upstreams 8080}}"
+      caddy.0_reverse_proxy.0_header_up: X-Real-IP {remote}
+      caddy.encode: zstd gzip
+      caddy.log:
+
+        # ---------------------------------------------------------------------------
+        # The signal generator itself.
+        #   http://localhost:4000  -> dashboard + long-poll + SSE + WebSocket
+        #   localhost:50051        -> gRPC
+        # ---------------------------------------------------------------------------
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+      - "50051:50051"
+    environment:
+      PORT: "4000"
+      GRPC_PORT: "50051"
+      KAFKA_ENABLED: "true"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "signals"
+      GENERATOR_INTERVAL_MS: "700"
+      SECRET_KEY_BASE: "please_change_me_this_is_a_dev_only_key_000000000000000000000000000000"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      default:
+      caddy-ingress:
+    labels:
+      # HTTP: dashboard + long-poll + SSE + WebSocket
+      caddy_0: meowmetry-app.dev1.mnt.group
+      caddy_0.0_reverse_proxy: "{{upstreams 4000}}"
+      caddy_0.0_reverse_proxy.0_header_up: X-Real-IP {remote}
+      caddy_0.encode: zstd gzip
+      caddy_0.log: # gRPC: proxied over h2c (HTTP/2 cleartext) to the backend
+
+      caddy_1: meowmetry-grpc.dev1.mnt.group
+      caddy_1.0_reverse_proxy: "{{upstreams h2c 50051}}"
+      caddy_1.0_reverse_proxy.0_header_up: X-Real-IP {remote}
+      caddy_1.log:
+
+        # ---------------------------------------------------------------------------
+        # Observability stack — direct OTLP, no collector.
+        #
+        #   metrics (WS)   -> otel_metrics_bridge.py -- OTLP push --> VictoriaMetrics
+        #   traces  (poll) -> tempo_bridge.py        -- OTLP push --> Tempo
+        #                                                             \--> Grafana <--/
+        #
+        # Both VictoriaMetrics and Tempo ingest OTLP natively, so each bridge pushes
+        # straight to its store — no OpenTelemetry Collector and no scrape hop.
+        #   grafana : reads VictoriaMetrics + Tempo (http://localhost:3000, anon admin)
+        # ---------------------------------------------------------------------------
+
+        # Stores metrics. Ingests OTLP at /opentelemetry/v1/metrics; Prometheus-
+        # compatible query API on :8428 (Grafana talks to it as a Prometheus source).
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.102.1
+    restart: unless-stopped
+    command: [ "--retentionPeriod=1d" ]
+    ports:
+      - "8428:8428"
+    depends_on:
+      - app
+    networks:
+      default:
+      caddy-ingress:
+    labels:
+      caddy: meowmetry-victoriametrics.dev1.mnt.group
+      caddy.0_reverse_proxy: "{{upstreams 8428}}"
+      caddy.0_reverse_proxy.0_header_up: X-Real-IP {remote}
+      caddy.encode: zstd gzip
+      caddy.log:
+
+        # Tempo stores traces; the bridge pushes them in over OTLP (gRPC 4317 / HTTP 4318).
+  tempo:
+    image: grafana/tempo:2.6.1
+    restart: unless-stopped
+    command: [ "-config.file=/etc/tempo.yaml" ]
+    ports:
+      - "3200:3200" # Tempo query API (Grafana datasource)
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    volumes:
+      - ./deploy/tempo/tempo.yaml:/etc/tempo.yaml:ro
+    networks:
+      default:
+      caddy-ingress:
+    labels:
+      caddy: meowmetry-tempo.dev1.mnt.group
+      caddy.0_reverse_proxy: "{{upstreams 3200}}"
+      caddy.0_reverse_proxy.0_header_up: X-Real-IP {remote}
+      caddy.encode: zstd gzip
+      caddy.log:
+
+  # ---------------------------------------------------------------------------
+  # OTLP bridges. Each reads one signal stream from the app (in-network at
+  # app:4000) and pushes it to its OTLP-native store — no collector, no scrape.
+  # They run automatically on `docker compose up`, installing their Python deps
+  # from clients/requirements.txt on start. Both retry/reconnect on their own,
+  # so they tolerate the app or store not being ready yet.
+  #
+  #   metrics (WS)   -> otel_metrics_bridge.py -- OTLP push --> VictoriaMetrics
+  #   trace   (poll) -> tempo_bridge.py        -- OTLP push --> Tempo
+  # ---------------------------------------------------------------------------
+  tempo-bridge:
+    image: python:3.12-slim
+    restart: unless-stopped
+    working_dir: /clients
+    volumes:
+      - ./clients:/clients:ro
+    command:
+      - bash
+      - -lc
+      - "pip install -q -r requirements.txt &&
+         python tempo_bridge.py http://app:4000/api/poll http://tempo:4318"
+    depends_on:
+      - app
+      - tempo
+    networks:
+      default:
+
+  metrics-bridge:
+    image: python:3.12-slim
+    restart: unless-stopped
+    working_dir: /clients
+    volumes:
+      - ./clients:/clients:ro
+    command:
+      - bash
+      - -lc
+      - "pip install -q -r requirements.txt &&
+         python otel_metrics_bridge.py ws://app:4000/ws http://victoriametrics:8428/opentelemetry"
+    depends_on:
+      - app
+      - victoriametrics
+    networks:
+      default:
+
+        # Pre-wired with VictoriaMetrics + Tempo datasources and starter dashboards.
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # First admin user, created on first boot. Change the password!
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "dondon"
+      # Real login: show the form, no anonymous access, no open sign-up.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlMetrics"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - victoriametrics
+      - tempo
+    networks:
+      default:
+      caddy-ingress:
+    labels:
+      caddy: meowmetry-grafana.dev1.mnt.group
+      caddy.0_reverse_proxy: "{{upstreams 3000}}"
+      caddy.0_reverse_proxy.0_header_up: X-Real-IP {remote}
+      caddy.encode: zstd gzip
+      caddy.log:
+
+volumes:
+  grafana-data:
+
+networks:
+  # Pre-existing network that the caddy-docker-proxy ingress watches for labels.
+  caddy-ingress:
+    external: true
