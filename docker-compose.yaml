@@ -53,83 +53,23 @@ services:
         condition: service_healthy
     networks:
       default:
-      caddy-ingress:
-    labels:
-      caddy: meowmetry-kafkaui.dev1.mnt.group
-      caddy.0_reverse_proxy: "{{upstreams 8080}}"
-      caddy.0_reverse_proxy.0_header_up: X-Real-IP {remote}
-      caddy.encode: zstd gzip
-      caddy.log:
+
 
         # ---------------------------------------------------------------------------
         # The signal generator itself.
         #   http://localhost:4000  -> dashboard + long-poll + SSE + WebSocket
         #   localhost:50051        -> gRPC
         # ---------------------------------------------------------------------------
-  app:
-    build: .
-    restart: unless-stopped
-    ports:
-      - "4000:4000"
-      - "50051:50051"
-    environment:
-      PORT: "4000"
-      GRPC_PORT: "50051"
-      KAFKA_ENABLED: "true"
-      KAFKA_BROKERS: "kafka:9092"
-      KAFKA_TOPIC: "signals"
-      GENERATOR_INTERVAL_MS: "700"
-      SECRET_KEY_BASE: "please_change_me_this_is_a_dev_only_key_000000000000000000000000000000"
-    depends_on:
-      kafka:
-        condition: service_healthy
-    networks:
-      default:
-      caddy-ingress:
-    labels:
-      # HTTP: dashboard + long-poll + SSE + WebSocket
-      caddy_0: meowmetry-app.dev1.mnt.group
-      caddy_0.0_reverse_proxy: "{{upstreams 4000}}"
-      caddy_0.0_reverse_proxy.0_header_up: X-Real-IP {remote}
-      caddy_0.encode: zstd gzip
-      caddy_0.log: # gRPC: proxied over h2c (HTTP/2 cleartext) to the backend
 
-      caddy_1: meowmetry-grpc.dev1.mnt.group
-      caddy_1.0_reverse_proxy: "{{upstreams h2c 50051}}"
-      caddy_1.0_reverse_proxy.0_header_up: X-Real-IP {remote}
-      caddy_1.log:
-
-        # ---------------------------------------------------------------------------
-        # Observability stack — direct OTLP, no collector.
-        #
-        #   metrics (WS)   -> otel_metrics_bridge.py -- OTLP push --> VictoriaMetrics
-        #   traces  (poll) -> tempo_bridge.py        -- OTLP push --> Tempo
-        #                                                             \--> Grafana <--/
-        #
-        # Both VictoriaMetrics and Tempo ingest OTLP natively, so each bridge pushes
-        # straight to its store — no OpenTelemetry Collector and no scrape hop.
-        #   grafana : reads VictoriaMetrics + Tempo (http://localhost:3000, anon admin)
-        # ---------------------------------------------------------------------------
-
-        # Stores metrics. Ingests OTLP at /opentelemetry/v1/metrics; Prometheus-
-        # compatible query API on :8428 (Grafana talks to it as a Prometheus source).
   victoriametrics:
     image: victoriametrics/victoria-metrics:v1.102.1
     restart: unless-stopped
     command: [ "--retentionPeriod=1d" ]
     ports:
       - "8428:8428"
-    depends_on:
-      - app
     networks:
       default:
-      caddy-ingress:
-    labels:
-      caddy: meowmetry-victoriametrics.dev1.mnt.group
-      caddy.0_reverse_proxy: "{{upstreams 8428}}"
-      caddy.0_reverse_proxy.0_header_up: X-Real-IP {remote}
-      caddy.encode: zstd gzip
-      caddy.log:
+
 
         # Tempo stores traces; the bridge pushes them in over OTLP (gRPC 4317 / HTTP 4318).
   tempo:
@@ -144,13 +84,7 @@ services:
       - ./deploy/tempo/tempo.yaml:/etc/tempo.yaml:ro
     networks:
       default:
-      caddy-ingress:
-    labels:
-      caddy: meowmetry-tempo.dev1.mnt.group
-      caddy.0_reverse_proxy: "{{upstreams 3200}}"
-      caddy.0_reverse_proxy.0_header_up: X-Real-IP {remote}
-      caddy.encode: zstd gzip
-      caddy.log:
+
 
   # ---------------------------------------------------------------------------
   # OTLP bridges. Each reads one signal stream from the app (in-network at
@@ -174,7 +108,6 @@ services:
       - "pip install -q -r requirements.txt &&
          python tempo_bridge.py http://app:4000/api/poll http://tempo:4318"
     depends_on:
-      - app
       - tempo
     networks:
       default:
@@ -191,7 +124,6 @@ services:
       - "pip install -q -r requirements.txt &&
          python otel_metrics_bridge.py ws://app:4000/ws http://victoriametrics:8428/opentelemetry"
     depends_on:
-      - app
       - victoriametrics
     networks:
       default:
@@ -220,18 +152,7 @@ services:
       - tempo
     networks:
       default:
-      caddy-ingress:
-    labels:
-      caddy: meowmetry-grafana.dev1.mnt.group
-      caddy.0_reverse_proxy: "{{upstreams 3000}}"
-      caddy.0_reverse_proxy.0_header_up: X-Real-IP {remote}
-      caddy.encode: zstd gzip
-      caddy.log:
+
 
 volumes:
   grafana-data:
-
-networks:
-  # Pre-existing network that the caddy-docker-proxy ingress watches for labels.
-  caddy-ingress:
-    external: true
